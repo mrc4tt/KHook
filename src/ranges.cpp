@@ -48,30 +48,72 @@ bool Add(std::unique_ptr<Range> range) {
     return true;
 }
 
-std::uintptr_t Lookup(std::uintptr_t start, std::size_t size, const std::string& bytes) {
-	// Parse the bytes sequence
-	std::vector<std::uint16_t> sequence;
-	auto c_string = bytes.c_str();
+static int HexDigit(const char c) {
+	return ('0' <= c && c <= '9') ? c - '0'
+	: ('a' <= c && c <= 'f') ? 10 + (c - 'a')
+	: ('A' <= c && c <= 'F') ? 10 + (c - 'A') : -1;
+}
 
-	static auto p = [](const char c) {
-		return ('0' <= c && c <= '9') ? c - '0'
-		: ('a' <= c && c <= 'f') ? 10 + (c - 'a')
-		: ('A' <= c && c <= 'F') ? 10 + (c - 'A') : -1;
-	};
+static bool Refuse(std::vector<std::uint16_t>& out, std::string* out_error, std::string message) {
+	out.clear();
+	if (out_error) {
+		*out_error = std::move(message);
+	}
+	return false;
+}
 
-	for (int i = 0; i <= bytes.size(); i++) {
-		if (i == bytes.size() || bytes[i] == ' ') {
-			// New bytes/end of string. Process what we parsed
-			if ((i == 1 || c_string[i - 2] == '?' ||  c_string[i - 2] == ' ') && c_string[i - 1] == '?') {
-				// Wildcard
-				sequence.push_back(0xFFFF);
-			} else if (p(c_string[i - 1]) != -1 && p(c_string[i - 2]) != -1) {
-				std::uint16_t parsed = p(c_string[i - 1]) + (16 * p(c_string[i - 2]));
-				sequence.push_back(parsed);
-			} else {
-				return 0;
-			}
+bool ParseSignature(const std::string& bytes, std::vector<std::uint16_t>& out, std::string* out_error) {
+	out.clear();
+
+	const auto first = bytes.find_first_not_of(' ');
+	if (first == std::string::npos) {
+		return Refuse(out, out_error, "empty pattern");
+	}
+	const auto last = bytes.find_last_not_of(' ');
+
+	std::size_t literals = 0;
+	for (std::size_t pos = first; pos <= last;) {
+		auto end = bytes.find(' ', pos);
+		if (end == std::string::npos || end > last) {
+			end = last + 1;
 		}
+
+		const auto token = bytes.substr(pos, end - pos);
+		if (token.empty()) {
+			return Refuse(out, out_error, "empty token at offset " + std::to_string(pos));
+		}
+
+		if (token == "?" || token == "??") {
+			out.push_back(WILDCARD);
+		} else if (token.size() == 2 && HexDigit(token[0]) != -1 && HexDigit(token[1]) != -1) {
+			out.push_back(static_cast<std::uint16_t>(HexDigit(token[0]) * 16 + HexDigit(token[1])));
+			literals++;
+		} else {
+			return Refuse(out, out_error, "invalid token \"" + token + "\" at offset " + std::to_string(pos));
+		}
+
+		pos = end + 1;
+	}
+
+	if (literals < MIN_LITERAL_BYTES) {
+		return Refuse(out, out_error, "pattern has " + std::to_string(literals) + " literal byte(s), at least "
+			+ std::to_string(MIN_LITERAL_BYTES) + " required");
+	}
+
+	return true;
+}
+
+std::uintptr_t Lookup(std::uintptr_t start, std::size_t size, const std::string& bytes) {
+	std::vector<std::uint16_t> sequence;
+	if (!ParseSignature(bytes, sequence)) {
+		return 0;
+	}
+	return Lookup(start, size, sequence);
+}
+
+std::uintptr_t Lookup(std::uintptr_t start, std::size_t size, const std::vector<std::uint16_t>& sequence) {
+	if (sequence.empty() || size < sequence.size()) {
+		return 0;
 	}
 
 	std::shared_lock lock(g_mutex);
@@ -85,7 +127,7 @@ std::uintptr_t Lookup(std::uintptr_t start, std::size_t size, const std::string&
 	});
 
 	const auto& it_end = g_ranges.end();
-	for (auto lookup = start, lookup_end = lookup + size; lookup < lookup_end; lookup++) {
+	for (auto lookup = start, lookup_end = start + size - sequence.size() + 1; lookup < lookup_end; lookup++) {
 		// Move the iterator further until we intersect again
 		while (it != it_end && (*it)->end < lookup) {
 			it++;

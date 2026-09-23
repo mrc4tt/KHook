@@ -6,7 +6,10 @@ for compiler in TestRunner.all_targets:
   binary = compiler.Program(projectName)
   compiler = binary.compiler
 
-  compiler.cxxincludes += [os.path.join(builder.sourcePath, 'include')]
+  compiler.cxxincludes += [
+    os.path.join(builder.sourcePath, 'include'),
+    os.path.join(builder.sourcePath, 'src'),
+  ]
   compiler.cxxdefines += ['KHOOK_STANDALONE','KHOOK_EXPORT']
 
   for task in TestRunner.libkhook:
@@ -33,6 +36,7 @@ for compiler in TestRunner.all_targets:
     'test_virtuals.cpp',
     'test_virtual_hook.cpp',
     'test_ranges.cpp',
+    'test_signature_parse.cpp',
     'test_hook_removal.cpp'
   ]
 
