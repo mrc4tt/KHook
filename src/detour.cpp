@@ -4,6 +4,7 @@
 #include <stack>
 #include <iostream>
 #include <list>
+#include <atomic>
 
 namespace KHook {
 
@@ -1493,13 +1494,16 @@ bool DetourCapsule::InsertHook(HookID_t id, const DetourCapsule::InsertHookDetai
 	return true;
 }
 
-void DetourCapsule::RemoveHook(HookID_t id) {
+bool DetourCapsule::RemoveHook(HookID_t id) {
 	if (_in_deletion) {
 		// We're being deleted it doesn't matter, abort
-		return;
+		return true;
 	}
 
-	std::lock_guard guard(_detour_mutex);
+	std::unique_lock guard(_detour_mutex, std::try_to_lock);
+	if (!guard.owns_lock()) {
+		return false;
+	}
 
 	auto it = _callbacks.find(id);
 	if (it != _callbacks.end()) {
@@ -1536,6 +1540,7 @@ void DetourCapsule::RemoveHook(HookID_t id) {
 			PushPopCurrentHook(reinterpret_cast<void*>(ctx_ptr), false);
 		}
 	}
+	return true;
 }
 
 struct GlobalState {
@@ -1549,7 +1554,7 @@ struct GlobalState {
 	std::mutex insert_hooks_mutex;
 	std::list<std::pair<HookID_t, DetourCapsule::InsertHookDetails>> insert_hooks;
 	std::mutex delete_hooks_mutex;
-	std::unordered_map<HookID_t, std::pair<void (*)(KHook::HookID_t, void*), void*>> delete_hooks;
+	std::unordered_multimap<HookID_t, std::pair<void (*)(KHook::HookID_t, void*), void*>> delete_hooks;
 };
 
 static GlobalState* g_globals = new GlobalState();
@@ -1570,20 +1575,30 @@ bool __InsertHook_Sync(HookID_t id, const DetourCapsule::InsertHookDetails& deta
 	return ret;
 }
 
-void __RemoveHook_Sync(HookID_t id) {
-	std::lock_guard associated_guard(globals().associated_hooks_mutex);
-	auto it = globals().associated_hooks.find(id);
-	if (it == globals().associated_hooks.end()) {
-		return;
+bool __RemoveHook_Sync(HookID_t id, bool wait) {
+	while (true) {
+		{
+			std::lock_guard associated_guard(globals().associated_hooks_mutex);
+			auto it = globals().associated_hooks.find(id);
+			if (it == globals().associated_hooks.end()) {
+				return true;
+			}
+
+			if (it->second->RemoveHook(id)) {
+				globals().associated_hooks.erase(id);
+				return true;
+			}
+		}
+
+		if (!wait) {
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	}
-
-	it->second->RemoveHook(id);
-
-	globals().associated_hooks.erase(id);
 }
 
 // Worker thread that insert/deletes hook
-bool g_terminate_worker = false;
+std::atomic<bool> g_terminate_worker = false;
 
 std::thread g_insert_thread([]{
 	while (!g_terminate_worker) {
@@ -1613,7 +1628,8 @@ std::thread g_insert_thread([]{
 });
 
 std::thread g_delete_thread([]{
-	while (!g_terminate_worker) {
+	while (true) {
+		decltype(globals().delete_hooks) retry_hooks;
 		globals().delete_hooks_mutex.lock();
 		while (globals().delete_hooks.begin() != globals().delete_hooks.end()) {
 			auto it = globals().delete_hooks.begin();
@@ -1625,16 +1641,29 @@ std::thread g_delete_thread([]{
 			// Let other threads add more hooks to delete
 			globals().delete_hooks_mutex.unlock();
 
-			__RemoveHook_Sync(id);
+			bool ret = __RemoveHook_Sync(id, false);
+
+			if (ret && remove_fn) {
+				remove_fn(id, context);
+			}
 
 			// Relock thread for loop condition
 			globals().delete_hooks_mutex.lock();
 
-			if (remove_fn) {
-				remove_fn(id, context);
+			if (!ret) {
+				retry_hooks.emplace(id, std::make_pair(remove_fn, context));
 			}
 		}
+		globals().delete_hooks.insert(retry_hooks.begin(), retry_hooks.end());
+
+		if(g_terminate_worker && globals().delete_hooks.empty())
+		{
+			globals().delete_hooks_mutex.unlock();
+			break;
+		}
+
 		globals().delete_hooks_mutex.unlock();
+
 		std::this_thread::sleep_for(std::chrono::milliseconds(5));
 	}
 });
@@ -1826,6 +1855,10 @@ KHOOK_API void RemoveHook(
 		auto it = globals().associated_hooks.find(id);
 		if (it == globals().associated_hooks.end()) {
 			globals().associated_hooks_mutex.unlock_shared();
+
+			if (hook_removal_fn) {
+				hook_removal_fn(id, context);
+			}
 			return;
 		}
 
@@ -1835,7 +1868,7 @@ KHOOK_API void RemoveHook(
 
 		globals().associated_hooks_mutex.unlock_shared();
 	} else {
-		__RemoveHook_Sync(id);
+		__RemoveHook_Sync(id, true);
 
 		if (hook_removal_fn) {
 			hook_removal_fn(id, context);
