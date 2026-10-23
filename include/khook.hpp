@@ -2097,6 +2097,27 @@ inline std::int32_t __GetVtableIndex__(const std::uint8_t* func_addr) {
 	if (func_addr[0] == 0x48 && func_addr[1] == 0x8B && func_addr[2] == 0x01) {
 		func_addr = func_addr + 3;
 	}
+	// clang-cl does not tail-jump through memory like MSVC does; its vcall thunk
+	// loads the slot into rax first and then jumps to the register:
+	//   mov rax, [rax + disp]  (48 8B 00 | 48 8B 40 d8 | 48 8B 80 d32)
+	//   jmp rax                (48 FF E0)
+	if (func_addr[0] == 0x48 && func_addr[1] == 0x8B) {
+		const std::uint8_t* jmp = nullptr;
+		std::int32_t disp = 0;
+		if (func_addr[2] == 0x00) {
+			jmp = func_addr + 3;
+		} else if (func_addr[2] == 0x40) {
+			disp = *((std::int8_t*)(func_addr + 3));
+			jmp = func_addr + 4;
+		} else if (func_addr[2] == 0x80) {
+			disp = *((std::int32_t*)(func_addr + 3));
+			jmp = func_addr + 7;
+		}
+		if (jmp != nullptr && jmp[0] == 0x48 && jmp[1] == 0xFF && jmp[2] == 0xE0) {
+			return disp / sizeof(void*);
+		}
+		return -1;
+	}
 #else
 	// mov eax, [ecx]
 	if (func_addr[0] == 0x8B && func_addr[1] == 0x01) {
